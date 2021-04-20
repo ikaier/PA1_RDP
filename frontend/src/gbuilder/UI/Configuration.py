@@ -3,13 +3,19 @@
 import sys, os, random
 from PyQt4 import QtCore, QtGui
 from Core.globals import *
+from Core.utils import ip_utils
+
+
+class SaveConfigurationError(Exception):
+    pass
+
 
 class LineEdit(QtGui.QLineEdit):
     def __init__(self, text=QtCore.QString()):
         """
         Create a custom LineEdit so that the context menu is visible.
         """
-        QtGui.QLineEdit.__init__(self, text)
+        super(LineEdit, self).__init__(text)
 
     def contextMenuEvent(self, event):
         """
@@ -19,12 +25,13 @@ class LineEdit(QtGui.QLineEdit):
         menu.setPalette(defaultOptions["palette"])
         menu.exec_(event.globalPos())
 
+
 class ServerPage(QtGui.QWidget):
     def __init__(self, parent=None):
         """
         Create a server configuration page.
         """
-        QtGui.QWidget.__init__(self, parent)
+        super(ServerPage, self).__init__(parent)
 
         configGroup = QtGui.QGroupBox(self.tr("Server configuration"))
 
@@ -56,7 +63,6 @@ class ServerPage(QtGui.QWidget):
         except:
             mainWidgets["log"].append("Failed to read from server list!")
 
-#       self.serverCombo.addItem(self.tr("localhost"))
         self.serverLine = LineEdit()
         self.addServerButton = QtGui.QPushButton("Add")
         self.delServerButton = QtGui.QPushButton("Delete")
@@ -201,59 +207,13 @@ class ServerPage(QtGui.QWidget):
         self.localPortLine.setText(options["localPort"])
         self.remotePortLine.setText(options["remotePort"])
 
-class UpdatePage(QtGui.QWidget):
-    def __init__(self, parent=None):
-        """
-        Create an update page.
-        """
-        QtGui.QWidget.__init__(self, parent)
-
-        updateGroup = QtGui.QGroupBox(self.tr("Package selection"))
-        systemCheckBox = QtGui.QCheckBox(self.tr("Update system"))
-        appsCheckBox = QtGui.QCheckBox(self.tr("Update applications"))
-        docsCheckBox = QtGui.QCheckBox(self.tr("Update documentation"))
-
-        packageGroup = QtGui.QGroupBox(self.tr("Existing packages"))
-
-        packageList = QtGui.QListWidget()
-        qtItem = QtGui.QListWidgetItem(packageList)
-        qtItem.setText(self.tr("Qt"))
-        qsaItem = QtGui.QListWidgetItem(packageList)
-        qsaItem.setText(self.tr("QSA"))
-        teamBuilderItem = QtGui.QListWidgetItem(packageList)
-        teamBuilderItem.setText(self.tr("Teambuilder"))
-
-        startUpdateButton = QtGui.QPushButton(self.tr("Start update"))
-
-        updateLayout = QtGui.QVBoxLayout()
-        updateLayout.addWidget(systemCheckBox)
-        updateLayout.addWidget(appsCheckBox)
-        updateLayout.addWidget(docsCheckBox)
-        updateGroup.setLayout(updateLayout)
-
-        packageLayout = QtGui.QVBoxLayout()
-        packageLayout.addWidget(packageList)
-        packageGroup.setLayout(packageLayout)
-
-        mainLayout = QtGui.QVBoxLayout()
-        mainLayout.addWidget(updateGroup)
-        mainLayout.addWidget(packageGroup)
-        mainLayout.addSpacing(12)
-        mainLayout.addWidget(startUpdateButton)
-        mainLayout.addStretch(1)
-
-        self.setLayout(mainLayout)
-
-    def saveOptions(self):
-        pass
-
 
 class GeneralPage(QtGui.QWidget):
     def __init__(self, parent=None):
         """
         Create a general configuration page.
         """
-        QtGui.QWidget.__init__(self, parent)
+        super(GeneralPage, self).__init__(parent)
 
         uiGroup = QtGui.QGroupBox(self.tr("User Interface"))
         self.createUICheckboxes()
@@ -282,6 +242,9 @@ class GeneralPage(QtGui.QWidget):
         baseThemeLayout.addWidget(self.chooseBaseColorButton)
         baseThemeLayout.setAlignment(QtCore.Qt.AlignLeft)
 
+        # TODO: Add configuration option for item spacing here
+        # self.item_spacing_slider = QtGui.QSlider(QtCore.Qt.Horizontal)
+
         uiLayout = QtGui.QVBoxLayout()
         uiLayout.addWidget(self.namesCheckBox)
         uiLayout.addWidget(self.gridCheckBox)
@@ -291,7 +254,7 @@ class GeneralPage(QtGui.QWidget):
         uiLayout.addWidget(self.moveAlertCheckBox)
         uiLayout.addWidget(self.gnomeTerminalCheckBox)
         uiLayout.addWidget(self.menuModsCheckBox)
-        
+
         uiLayout.addWidget(QtGui.QLabel(self.tr("Grid Color: ")))
         uiLayout.addLayout(gridLayout)
         uiLayout.addWidget(QtGui.QLabel(self.tr("Background: ")))
@@ -357,14 +320,16 @@ class GeneralPage(QtGui.QWidget):
         """
         # Qt is very picky in the filename structure but python is not, so we use python
         # to form the correct path which will work for both Windows and Linux
-        olddir = os.getcwd()
+        old_dir = os.getcwd()
         os.chdir(environ["images"])
-        loadpath = os.getcwd()
-        os.chdir(olddir)
+        load_path = os.getcwd()
+        os.chdir(old_dir)
 
-        return QtGui.QFileDialog.getOpenFileName(self,
-                self.tr("Choose a file name"), loadpath,
-                self.tr("All Files(*.*);;PNG (*.PNG);;JPEG (*.JPG;*.JPEG);;GIF (*.GIF)"))
+        return QtGui.QFileDialog.getOpenFileName(
+            self,
+            self.tr("Choose a file name"), load_path,
+            self.tr("All Files(*.*);;PNG (*.PNG);;JPEG (*.JPG;*.JPEG);;GIF (*.GIF)")
+        )
 
     def browseBackground(self):
         """
@@ -494,21 +459,30 @@ class GeneralPage(QtGui.QWidget):
 
         self.updateLook()
 
+
 class RuntimePage(QtGui.QWidget):
     def __init__(self, parent=None):
         """
         Create a general configuration page.
         """
-        QtGui.QWidget.__init__(self, parent)
+        super(RuntimePage, self).__init__(parent)
 
         compilationGroup = QtGui.QGroupBox(self.tr("Compilation / Runtime"))
         self.createCompilationCheckboxes()
+
+        base_network_label = QtGui.QLabel(self.tr("Base network:"))
+        self.base_network_input = LineEdit()
+
+        base_network_layout = QtGui.QHBoxLayout()
+        base_network_layout.addWidget(base_network_label)
+        base_network_layout.addWidget(self.base_network_input)
 
         compilationLayout = QtGui.QVBoxLayout()
         compilationLayout.addWidget(self.autoroutingCheckBox)
         compilationLayout.addWidget(self.autogenCheckBox)
         compilationLayout.addWidget(self.autocompileCheckBox)
         compilationLayout.addWidget(self.glowingCheckBox)
+        compilationLayout.addLayout(base_network_layout)
         compilationGroup.setLayout(compilationLayout)
 
         mainLayout = QtGui.QVBoxLayout()
@@ -536,6 +510,7 @@ class RuntimePage(QtGui.QWidget):
         self.autogenCheckBox.setChecked(options["autogen"])
         self.autocompileCheckBox.setChecked(options["autocompile"])
         self.glowingCheckBox.setChecked(options["glowingLights"])
+        self.base_network_input.setText(options["base_network"])
 
     def saveOptions(self):
         """
@@ -545,13 +520,20 @@ class RuntimePage(QtGui.QWidget):
         options["autogen"] = self.autogenCheckBox.isChecked()
         options["autocompile"] = self.autocompileCheckBox.isChecked()
         options["glowingLights"] = self.glowingCheckBox.isChecked()
+        if ip_utils.is_valid_base_network(self.base_network_input.text()):
+            options["base_network"] = self.base_network_input.text()
+        else:
+            raise SaveConfigurationError(
+                "Invalid network range!\n"
+                "Classful network with prefix length equals 8 or 16 expected")
+
 
 class ConfigDialog(QtGui.QDialog):
     def __init__(self, parent=None):
         """
         Create a config dialog window.
         """
-        QtGui.QDialog.__init__(self, parent)
+        super(ConfigDialog, self).__init__(parent)
 
         self.wizard = None
         self.loadOptions()
@@ -568,26 +550,27 @@ class ConfigDialog(QtGui.QDialog):
         self.generalPage = GeneralPage()
         self.runtimePage = RuntimePage()
         self.serverPage = ServerPage()
-        self.updatePage = UpdatePage()
         self.pagesWidget.addWidget(self.generalPage)
         self.pagesWidget.addWidget(self.runtimePage)
         self.pagesWidget.addWidget(self.serverPage)
-        #self.pagesWidget.addWidget(self.updatePage)
-
-        closeButton = QtGui.QPushButton(self.tr("Close"))
 
         self.createIcons()
         self.contentsWidget.setCurrentRow(0)
 
-        self.connect(closeButton, QtCore.SIGNAL("clicked()"), self, QtCore.SLOT("close()"))
+        apply_button = QtGui.QPushButton(self.tr("Apply"))
+        close_button = QtGui.QPushButton(self.tr("Close"))
+
+        self.connect(apply_button, QtCore.SIGNAL("clicked()"), self.apply_button_handler)
+        self.connect(close_button, QtCore.SIGNAL("clicked()"), self, QtCore.SLOT("close()"))
 
         horizontalLayout = QtGui.QHBoxLayout()
         horizontalLayout.addWidget(self.contentsWidget)
         horizontalLayout.addWidget(self.pagesWidget, 1)
 
         buttonsLayout = QtGui.QHBoxLayout()
-        buttonsLayout.addStretch(1)
-        buttonsLayout.addWidget(closeButton)
+        buttonsLayout.addStretch(2)
+        buttonsLayout.addWidget(apply_button)
+        buttonsLayout.addWidget(close_button)
 
         mainLayout = QtGui.QVBoxLayout()
         mainLayout.addLayout(horizontalLayout)
@@ -601,7 +584,42 @@ class ConfigDialog(QtGui.QDialog):
         self.setWindowIcon(QtGui.QIcon(environ["images"] + "giniLogo.png"))
 
         if not self.wizard and options["autoconnect"]:
-            mainWidgets["main"].startServer()
+            mainWidgets["main"].startBackend()
+
+    def show_update_error(self, error_message):
+        QtGui.QMessageBox.critical(
+            self,
+            "Error!",
+            error_message,
+            QtGui.QMessageBox.Ok
+        )
+
+    def apply_button_handler(self):
+        try:
+            self.generalPage.saveOptions()
+            self.runtimePage.saveOptions()
+            self.serverPage.saveOptions()
+        except SaveConfigurationError as e:
+            self.show_update_error(str(e))
+            return False
+
+        try:
+            outfile = open(environ["config"]+"settings", "w")
+            project = mainWidgets["main"].getProject()
+            if project:
+                project_file = open(project, "w")
+            for option, value in options.iteritems():
+                if option in ["username", "server", "session"] and project:
+                    project_file.write(option + "=" + str(value) + "\n")
+                outfile.write(option + "=" + str(value) + "\n")
+            if project:
+                project_file.close()
+            outfile.close()
+        except:
+            mainWidgets["log"].append("Cannot apply settings!")
+            return False
+
+        return True
 
     def loadOptions(self):
         """
@@ -671,40 +689,17 @@ class ConfigDialog(QtGui.QDialog):
         configButton.setTextAlignment(QtCore.Qt.AlignHCenter)
         configButton.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
 
-        """
-        updateButton = QtGui.QListWidgetItem(self.contentsWidget)
-        updateButton.setIcon(QtGui.QIcon(environ["images"] + "update.png"))
-        updateButton.setText(self.tr("Update"))
-        updateButton.setTextAlignment(QtCore.Qt.AlignHCenter)
-        updateButton.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
-        """
-
         self.connect(self.contentsWidget,
                      QtCore.SIGNAL("currentItemChanged(QListWidgetItem *, QListWidgetItem *)"), self.changePage)
 
-    def hideEvent(self, event):
+    def closeEvent(self, event):
         """
         Handle closing the config window.
         """
-        self.generalPage.saveOptions()
-        self.runtimePage.saveOptions()
-        self.serverPage.saveOptions()
-        self.updatePage.saveOptions()
-
-        try:
-            outfile = open(environ["config"]+"settings", "w")
-            project = mainWidgets["main"].getProject()
-            if project:
-                projectfile = open(project, "w")
-            for option, value in options.iteritems():
-                if (option == "username" or option == "server" or option == "session") and project:
-                    projectfile.write(option + "=" + str(value) + "\n")
-                outfile.write(option + "=" + str(value) + "\n")
-            if project:
-                projectfile.close()
-            outfile.close()
-        except:
-            mainWidgets["log"].append("Failed to save settings!")
+        if not self.apply_button_handler():
+            event.ignore()
+            return
+        return super(ConfigDialog, self).closeEvent(event)
 
     def updateSettings(self):
         """
@@ -714,12 +709,13 @@ class ConfigDialog(QtGui.QDialog):
         self.runtimePage.updateSettings()
         self.serverPage.updateSettings()
 
+
 class Wizard(QtGui.QWizard):
-    def __init__(self, parent = None):
+    def __init__(self, parent=None):
         """
         Create a first time configuration wizard.
         """
-        QtGui.QWizard.__init__(self)
+        super(Wizard, self).__init__()
 
         self.parent = parent
         self.setWindowTitle("Initial Setup")
@@ -729,10 +725,10 @@ class Wizard(QtGui.QWizard):
 
         self.systrayCheckBox = QtGui.QCheckBox("Use system tray (hide on close)")
 
-        self.usernameLine = LineEdit()
+        self.usernameLine = LineEdit(QtCore.QString(os.getlogin()))
         self.usernameLine.setToolTip("This username should be your login username to the\nserver or session you specify below.")
 
-        self.serverLine = LineEdit("localhost")
+        self.serverLine = LineEdit(QtCore.QString("localhost"))
         self.serverLine.setToolTip("This server will run the GINI backend and connect to gbuilder.\nNote that this server must have the backend program installed.")
 
         self.sessionLine = LineEdit()

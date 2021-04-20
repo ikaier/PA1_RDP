@@ -1,15 +1,17 @@
-from Core.Connection import *
 from Core.Interfaceable import *
-from Core.globals import environ
 from PyQt4.QtCore import QPoint
 
+
 class Mach(Interfaceable):
-    device_type="Mach"
+    device_type = "Mach"
 
     def __init__(self):
-        Interfaceable.__init__(self)
+        super(Mach, self).__init__()
 
-        self.setProperty("filetype", "cow")
-        self.setProperty("filesystem", "root_fs_beta2")
+        self.setProperty("os", "glinux")
 
-        self.lightPoint = QPoint(-10,3)
+        self.setProperty("ipv4", "")
+        self.setProperty("port", "")
+        self.setProperty("mac", "")
+
+        self.lightPoint = QPoint(-10, 3)

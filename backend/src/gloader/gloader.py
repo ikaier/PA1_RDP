@@ -3,134 +3,189 @@
 # Revised by Daniel Ng
 # Revised to Docker version by Mahesh
 
-import sys, os, signal, time, subprocess, re
+import sys
+import os
+import time
+import subprocess
+import socket
+import json
 
 from program import Program
-#import batch_ipcrm
 
 # set the program names
-VS_PROG = "uswitch"
-VM_PROG = "glinux"
-GR_PROG = "grouter"
-VOFC_PROG = "gpox"
-GWR_PROG = "gwcenter.sh"
-MCONSOLE_PROG = "uml_mconsole"
+OPEN_VIRTUAL_SWITCH_PROGRAM = "gvirtual-switch"
+GROUTER_PROGRAM = "grouter"
+OPENFLOW_CONTROLLER_PROGRAM = "gpox"
 SOCKET_NAME = "gini_socket"
-VS_PROG_BIN = VS_PROG
-VM_PROG_BIN = VM_PROG
-GR_PROG_BIN = GR_PROG
-VOFC_PROG_BIN = VOFC_PROG
-GWR_PROG_BIN = GWR_PROG
-MCONSOLE_PROG_BIN = MCONSOLE_PROG
-SRC_FILENAME = "%s/gini_setup" % os.environ["GINI_HOME"] # setup file name
-GINI_TMP_FILE = ".gini_tmp_file" # tmp file used when checking alive UML
+OPEN_VIRTUAL_SWITCH_PROGRAM_BIN = OPEN_VIRTUAL_SWITCH_PROGRAM
+GROUTER_PROGRAM_BIN = GROUTER_PROGRAM
+OPENFLOW_CONTROLLER_PROGRAM_BIN = OPENFLOW_CONTROLLER_PROGRAM
+
+SOURCE_FILE_NAME = "%s/gini_setup" % os.environ["GINI_HOME"]    # setup file name
+GINI_TEMP_DIR = "%s/tmp/" % os.environ["GINI_HOME"]
+GINI_TEMP_FILE = ".gini_tmp_file"    # tmp file used when checking alive Mach
+
 nodes = []
-tapNameMap = dict()
-subnetMap = dict()
-dockerNetworkNameMap = dict()
+tap_interface_names_map = dict()
+subnet_map = dict()
+network_name_map = dict()
+target_mode = {
+        "Mach": "m",
+        "Router": "r",
+        "Switch": "s",
+        "OVSwitch": "o",
+        "Cloud": "c"
+    }
 
 # set this switch True if running gloader without gbuilder
 independent = False
 
+
 def system(command):
     subprocess.call(["/bin/bash", "-c", command])
+
 
 def popen(command):
     subprocess.Popen(["/bin/bash", "-c", command])
 
-def startGINI(myGINI, options):
-    "starting the GINI network components"
+
+def start_GINI(gini, opts):
+    """Start the GINI network components"""
     # the starting order is important here
-    # first switches, then routers, and at last UMLs.
-    print "\nStarting Docker Switches..."
-    success = createVS(myGINI, options.switchDir)
-    #print "\nStarting Mobiles..."
-    #success = success and createVMB(myGINI, options)
+    # first switches, then routers, and at last Machs.
+    print "\nStarting Switches..."
+    status = create_virtual_switches(gini, opts)
     print "\nStarting OpenFlow controllers..."
-    success = success and createVOFC(myGINI, options)
+    status = status and create_openflow_controllers(gini, opts)
     print "\nStarting GINI routers..."
-    success = success and createVR(myGINI, options)
+    status = status and create_virtual_routers(gini, opts)
     print "\nStarting Docker Machines..."
-    success = success and createVM(myGINI, options)
-    #print "\nStarting Wireless access points..."
-    #success = success and createVWR(myGINI, options)
-    #print "\nStarting REALMs..."
-    #success = success and createVRM(myGINI, options)
+    status = status and create_virtual_machines(gini, opts)
+    print "\nStarting cloud..."
+    status = status and create_cloud(gini, opts)
 
-    if (not success):
+    if not status:
         print "Problem in creating GINI network"
-        print "Terminating the partally started network (if any)"
-        destroyGINI(myGINI, options)
-    return success
+        print "Terminating the partially started network (if any)"
+        destroy_GINI(gini, opts)
+    return status
 
-def findSubnet4Switch(myGINI, sname):
 
+def find_subnet_for_switch(gini, switch_name):
     # Search the VMs for a matching target
-    for uml in myGINI.vm:
-        for netif in uml.interfaces:
-            if netif.target == sname:
+    for mach in gini.vm:
+        for netif in mach.interfaces:
+            if netif.target == switch_name:
                 return netif.network
 
     # Search the Routers for a matching target
-    for vr in myGINI.vr:
+    for vr in gini.vr:
         for nif in vr.netIF:
-            if nif.target == sname:
+            if nif.target == switch_name:
                 return nif.network
 
     return ""
 
 
-def createVS(myGINI, switchDir):
-    "create the switch config file and start the switch"
-    # create the main switch directory
-    makeDir(switchDir)
+def create_open_virtual_switches(gini, switch_dir, switch):
+    print "\tStarting %s...\t" % switch.name,
+    sub_switch_dir = switch_dir + "/" + switch.name
+    make_dir(sub_switch_dir)
+    old_dir = os.getcwd()
+    os.chdir(sub_switch_dir)
 
-    for switch in myGINI.switches:
-        print "Starting %s...\t" % switch.name,
-        subSwitchDir = switchDir + "/" + switch.name
-        makeDir(subSwitchDir)
+    undo_file = "%s/stopit.sh" % sub_switch_dir
+    undo_out = open(undo_file, "w")
+    undo_out.write("#!/bin/bash\n\n")
+
+    subnet = find_subnet_for_switch(gini, switch.name)
+    if subnet != "":
+        gateway_ip = subnet.rsplit('.', 1)[0] + '.1'
+        start_file = "%s/startit.sh" % sub_switch_dir
+        start_out = open(start_file, "w")
+        start_out.write("#!/bin/bash\n\n")
+        startup_commands = "ovs-vsctl add-br %s &&\n" % switch.name
+        startup_commands += "ip addr add %s/24 dev %s &&\n" % (gateway_ip, switch.name)
+        startup_commands += "ip link set %s up &&\n" % switch.name
+        startup_commands += "ovs-vsctl set-fail-mode %s standalone &&\n" % switch.name
+        start_out.write(startup_commands)
+
+        screen_command = "screen -d -m -L -S %s " % switch.name
+        screen_command += "%s %s\n" % (OPEN_VIRTUAL_SWITCH_PROGRAM, switch.name)
+        start_out.write(screen_command)
+
+        os.chmod(start_file, 0755)
+        start_out.close()
+
+        undo_out.write("ovs-vsctl del-br %s\n" % switch.name)
+        undo_out.write("screen -S %s -X quit\n" % switch.name)
+        os.chmod(undo_file, 0755)
+        undo_out.close()
+
+        runcmd = subprocess.Popen(start_file, shell=True, stdout=subprocess.PIPE)
+        runcmd.communicate()
+        if runcmd.returncode == 0:
+            subnet_map[subnet] = switch.name
+            print "[OK]"
+            os.chdir(old_dir)
+            return True
+        else:
+            print "[Failed]"
+            return False
+    else:
+        print "[Failed] Cannot find a subnet"
+        undo_out.close()
+        return False
+
+
+def create_virtual_switches(gini, opts):
+    """create the switch config file and start the switch"""
+    # create the main switch directory
+    switch_dir = opts.switchDir
+    make_dir(switch_dir)
+
+    for switch in gini.switches:
+        if switch.isOVS:
+            if create_open_virtual_switches(gini, switch_dir, switch):
+                continue
+            else:
+                print "[Failed] Error when creating Open virtual switch"
+                return False
+
+        print "\tStarting %s...\t" % switch.name,
+        subSwitchDir = switch_dir + "/" + switch.name
+        make_dir(subSwitchDir)
         undoFile = "%s/stopit.sh" % subSwitchDir
         undoOut = open(undoFile, "w")
         undoOut.write("#!/bin/bash\n")
 
-        subnet = findSubnet4Switch(myGINI, switch.name)
-        if (subnet != ""):
+        subnet = find_subnet_for_switch(gini, switch.name)
+        if subnet != "":
             # Check if the network is already created under another switch name
-            if subnetMap.get(subnet):
-                dockerNetworkNameMap[switch.name] = subnetMap[subnet]
+            if subnet_map.get(subnet):
+                network_name_map[switch.name] = subnet_map[subnet]
                 os.chmod(undoFile, 0755)
                 undoOut.close()
                 continue
 
             command = "docker network create %s --subnet %s/24" % (switch.name, subnet)
             runcmd = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-            out,err = runcmd.communicate()
+            out, err = runcmd.communicate()
             if runcmd.returncode == 0:
 
-                subnetMap[subnet] = switch.name
+                subnet_map[subnet] = switch.name
+                if switch.hub:
+                    bridge_name = "br-" + out[:12]
+                    subprocess.call("brctl setageing %s 0" % bridge_name, shell=True)
 
-                undoOut.write(
-                    """for i in ` docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' %s`;
-                    do
-                    docker network disconnect -f %s $i;
-                    done;
-                    """ % (out, out)
-                )
                 undoOut.write("docker network remove %s\n" % out)
                 os.chmod(undoFile, 0755)
                 print "[OK]"
             else:
                 command = """docker network inspect %s --format='{{.Id}}'""" % switch.name
                 q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-                out,err = q.communicate()
+                out, err = q.communicate()
                 if q.returncode == 0:
-                    undoOut.write(
-                        """for i in ` docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' %s`;
-                        do
-                        docker network disconnect -f %s $i;
-                        done;
-                        """ % (out, out)
-                    )
                     undoOut.write("docker network remove %s\n" % out)
                     os.chmod(undoFile, 0755)
                     print "[OK]"
@@ -139,6 +194,7 @@ def createVS(myGINI, switchDir):
                     undoOut.close()
                     return False
         else:
+            print "cannot find a subnet"
             print "[Failed]"
             undoOut.close()
             return False
@@ -146,764 +202,603 @@ def createVS(myGINI, switchDir):
         os.chmod(undoFile, 0755)
         undoOut.close()
     return True
-#End - createVS
 
 
-def createVWR(myGINI, options):
+def find_hidden_switch(router_name, switch_name):
+    x, rnum = router_name.split("_")
+    x, snum = switch_name.split("_")
+    switch_name = "Switch_r%s%s%s" % (rnum, target_mode[x], snum)
 
-    oldDir = os.getcwd()
-    routerDir = options.routerDir
-
-    for wrouter in myGINI.vwr:
-        print "Starting Wireless access point %s...\t" % wrouter.name
-        subRouterDir = routerDir + "/" + wrouter.name
-        makeDir(subRouterDir)
-        configFile = "%s/wrouter.conf" % subRouterDir
-        configOut = open(configFile, "w")
-        configOut.write("ch set prop mode F\n")
-
-        if not independent:
-            canvasIn = open("%s/mobile_data/canvas.data" % routerDir, "r")
-            line = canvasIn.readline()
-            canvasIn.close()
-            x = int(line.split(",")[0]) / 4
-            y = int(line.split(",")[1]) / 4
-            configOut.write("sys set map size %d %d 0\n" % (x, y))
-            wrouterIn = open("%s/mobile_data/%s.data" % (routerDir,wrouter.name), "r")
-            line = wrouterIn.readline()
-            wrouterIn.close()
-            relx = int(line.split(",")[0]) / 4
-            rely = int(line.split(",")[1]) / 4
-
-        else:
-            configOut.write("sys set map size 100 100 0\n")
-
-        for mobile in myGINI.vmb:
-            node = nodes.index(mobile.name) + 1
-            configOut.write("mov set node %d switch off\n" % node)
-            if not independent:
-                nodeIn = open("%s/mobile_data/%s.data" % (routerDir,mobile.name), "r")
-                line = nodeIn.readline()
-                nodeIn.close()
-                x = int(line.split(",")[0]) / 4
-                y = int(line.split(",")[1]) / 4
-                configOut.write("mov set node %d location %d %d 0\n" % (node, x - relx, y - rely))
-            else:
-                configOut.write("mov set node %d location 0 0 0\n" % node)
-
-        for netWIF in wrouter.netIFWireless:
-            #netWIF.printMe()
-            configOut.write(get_IF_properties(netWIF, len(myGINI.vmb)))
-
-        index = len(nodes)-1
-        if nodes and nodes[index].find("UML_") >= 0:
-            configOut.write("mov set node %d switch off\n" % (index + 1))
-            if not independent:
-                configOut.write("mov set node %d location %d %d 0\n" % (index + 1, relx, rely))
-            else:
-                configOut.write("mov set node %d location 0 0 0\n" % (index + 1))
-        configOut.write("echo -ne \"\\033]0;" + wrouter.name + "\\007\"")
-        configOut.close()
-
-        ### ------- execute ---------- ###
-        # go to the router directory to execute the command
-        os.chdir(os.environ["GINI_HOME"]+"/data")
-        cmd = "%s -i 1 -c %s -n %d -d uml_virtual_switch" % (GWR_PROG_BIN, configFile, len(nodes))
-        #print "running cmd %s" % cmd
-        wrouter.num = wrouter.name.split("Wireless_access_point_")[-1]
-        command = "screen -d -m -L -S WAP_%s %s" % (wrouter.num, cmd)
-        print "Waiting for Mobiles to finish starting up...\t",
-        sys.stdout.flush()
-        i = 0
-        ready = False
-        while not ready:
-            if i > 5:
-                print "There was an error in waiting for the mobiles to start up"
-                print "%s may not function properly" % wrouter.name
-                break
-            time.sleep(2)
-            for mobile in myGINI.vmb:
-                nwIf = mobile.interfaces[0]
-                configFile = "/tmp/%s.sh" % nwIf.mac.upper()
-                if os.access(configFile, os.F_OK):
-                    ready = False
-                    break
-                else:
-                    ready = True
-            i += 1
-
-        scriptOut = open("WAP%s_start.sh" % wrouter.num, "w")
-        scriptOut.write(command)
-        scriptOut.close()
-        os.chmod("WAP%s_start.sh" % wrouter.num, 0777)
-        system("./WAP%s_start.sh" % wrouter.num)
-        system("screen -d -m -L -S VWAP_%s Wireless_Parser" % wrouter.num)
-        os.chdir(oldDir)
-        print "[OK]"
-    return True
-
-def get_IF_properties(netWIF, num_nodes):
-    wcard = netWIF.wireless_card
-    #energy = netWIF.energy     not implemented by GWCenter
-    mobility = netWIF.mobility
-    antenna = netWIF.antenna
-    mlayer = netWIF.mac_layer
-
-    prop = ""
-    prop += "wcard set node 1 freq %f\n" % (float(wcard.freq)/1000000)
-    prop += "wcard set node 1 bandwidth %f\n" % (float(wcard.bandwidth)/1000000)
-    prop += "wcard set node 1 csthreshold %f\n" % (float(wcard.cs) * 1e8)
-    prop += "wcard set node 1 rxthreshold %f\n" % (float(wcard.rx) * 1e8)
-    prop += "wcard set node 1 cpthreshold %s\n" % wcard.cp
-    prop += "wcard set node 1 pt %s\n" % wcard.pt
-    prop += "wcard set node 1 ptx %s\n" % wcard.ptC
-    prop += "wcard set node 1 prx %s\n" % wcard.prC
-    prop += "wcard set node 1 pidle %s\n" % wcard.pIdle
-    prop += "wcard set node 1 psleep %s\n" % wcard.pSleep
-    prop += "wcard set node 1 poff %s\n" % wcard.pOff
-    prop += "wcard set node 1 modtype %s\n" % wcard.module[0]
-    for i in range(num_nodes):
-        prop += "ant set node %d height %s\n" % (i+1, antenna.ant_h)
-        prop += "ant set node %d gain %s\n" % (i+1, antenna.ant_g)
-        prop += "ant set node %d sysloss %s\n" % (i+1, antenna.ant_l)
-        prop += "ant set node %d jam %s\n" % (i+1, antenna.jam)
-    for i in range(num_nodes):
-        prop += "mov set node %d mode %s\n" % (i+1, mobility.mType[0])
-        prop += "mov set node %d spd min %s\n" % (i+1, mobility.ranMin)
-        prop += "mov set node %d spd max %s\n" % (i+1, mobility.ranMax)
-    for i in range(num_nodes):
-        if mlayer.macType == "MAC 802.11 DCF":
-            prop += "mac set node %d mode D11\n" % (i+1)
-        else:
-            prop += "mac set node %d mode %s\n" % (i+1, mlayer.macType[0])
-            prop += "mac set node %d txprob %s\n" % (i+1, mlayer.trans)
-    return prop
-
-
-def findHiddenSwitch(rtname, swname):
-
-    x,rnum = rtname.split("_")
-    x,snum = swname.split("_")
-    if x != "Router":
-        swname = "Switch_r%su%s" % (rnum, snum)
-    else:
-        swname = "Switch_r%sr%s" % (rnum, snum)
-
-    command = """docker network inspect %s --format='{{.Id}}'""" % swname
+    command = """docker network inspect %s --format='{{.Id}}'""" % switch_name
     q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-    out,err = q.communicate()
+    q.communicate()
     if q.returncode == 0:
-        return swname
-
-    return None
-#End findHiddenSwitch
-
-def findBridgeName(swname):
-
-    command = """docker network inspect %s --format='{{.Id}}'""" % swname
-    q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-    out,err = q.communicate()
-    if q.returncode == 0:
-        return "br-" + out[:12]
-
-    return None
-
-
-def createASwitch(rtname, swname, subnet, ofile):
-
-    x,rnum = rtname.split("_")
-    x,snum = swname.split("_")
-    if x != "Router":
-        swname = "Switch_r%su%s" % (rnum, snum)
+        return switch_name
     else:
-        swname = "Switch_r%sr%s" % (rnum, snum)
+        return None
 
-    # Similar to switch devices, check if the network is already created under another name
-    if subnetMap.get(subnet):
-        dockerNetworkNameMap[swname] = subnetMap[subnet]
-        swname = subnetMap[subnet]
 
-        command = "docker network inspect %s --format='{{.Id}}'" % swname
+def find_bridge_name(switch_name):
+    if switch_name.split("_")[0] == "Switch":
+        command = "docker network inspect %s --format='{{.Id}}'" % switch_name
+        is_ovs = False
+    else:
+        command = "ovs-ofctl show %s" % switch_name
+        is_ovs = True
+
+    q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
+    out, err = q.communicate()
+
+    if q.returncode == 0:
+        if is_ovs:
+            return switch_name, is_ovs
+        else:
+            return "br-" + out[:12], is_ovs
+    else:
+        return None, None
+
+
+def create_new_switch(router_name, switch_name, subnet, out_file):
+    x, router_num = router_name.split("_")
+    x, switch_num = switch_name.split("_")
+    switch_name = "Switch_r%s%s%s" % (router_num, target_mode[x], switch_num)
+
+    # Similar to switch_name devices, check if the network is already created under another name
+    if subnet_map.get(subnet):
+        network_name_map[switch_name] = subnet_map[subnet]
+        switch_name = subnet_map[subnet]
+
+        command = "docker network inspect %s --format='{{.Id}}'" % switch_name
         q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
         out, err = q.communicate()
         if q.returncode == 0:
             brname = "br-" + out[:12]
-            return swname, brname
+            return switch_name, brname
 
-    command = "docker network create %s --subnet %s/24" % (swname, subnet)
+    command = "docker network create %s --subnet %s/24" % (switch_name, subnet)
     q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-    out,err = q.communicate()
+    out, err = q.communicate()
     if q.returncode == 0:
-        subnetMap[subnet] = swname
+        subnet_map[subnet] = switch_name
 
         brname = "br-" + out[:12]
-        ofile.write(
-            """for i in ` docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' %s`;
-            do
-            docker network disconnect -f %s $i;
-            done;
-            """ % (out, out)
-        )
-        ofile.write("docker network remove %s" % out)
-        return swname, brname
+        out_file.write("docker network remove %s" % out)
+        return switch_name, brname
     else:
-        command = """docker network inspect %s --format='{{.Id}}'""" % swname
+        command = """docker network inspect %s --format='{{.Id}}'""" % switch_name
         q = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-        out,err = q.communicate()
+        out, err = q.communicate()
         if q.returncode == 0:
             brname = "br-" + out[:12]
-            ofile.write(
-                """for i in ` docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' %s`;
-                do
-                docker network disconnect -f %s $i;
-                done;
-                """ % (out, out)
-            )
-            ofile.write("\ndocker network remove %s\n" % out)
-            return swname, brname
+            out_file.write("\ndocker network remove %s\n" % out)
+            return switch_name, brname
         return None, None
-    # return the name of the newly created switch, bridge name
-# NOTE We can use the following command string to pull subne information
-# command = """docker network inspect %s --format='{{index .IPAM.Config 0 "Subnet"}}'""" % swname
 
-def setupTapInterface(rtname, swname, brname, ofile):
+
+def set_up_tap_interface(router_name, switch_name, bridge_name, out_file, is_ovs=False):
     # This assumes that the iproute2 (ip) utils work without
     # sudo - you need to turn on the setuid bit
+    x, router_num = router_name.split("_")
+    x, switch_num = switch_name.split("_")
 
-    x,rnum = rtname.split("_")
-    x,snum = swname.split("_")
-    if x != "Router":
-        tapKey = "Switch_r%su%s" % (rnum, snum)
+    tap_key = "Switch_r%s%s%s" % (router_num, target_mode[x], switch_num)
+
+    if tap_interface_names_map.get(tap_key) is None:
+        tap_interface_names_map[tap_key] = "tap" + str(len(tap_interface_names_map) + 1)
+    tap_name = tap_interface_names_map[tap_key]
+
+    command_to_execute = "ip tuntap add mode tap dev %s &&\n" % tap_name
+    command_to_execute += "ip link set %s up &&\n" % tap_name
+    if is_ovs:
+        command_to_execute += "ovs-vsctl add-port %s %s" % (bridge_name, tap_name)
     else:
-        tapKey = "Switch_r%sr%s" % (rnum, snum)
+        command_to_execute += "brctl addif %s %s" % (bridge_name, tap_name)
 
-    if tapNameMap.get(tapKey) is None:
-        tapNameMap[tapKey] = "tap" + str(len(tapNameMap)+1)
-    tapName = tapNameMap[tapKey]
-
-    subprocess.call("ip tuntap add mode tap dev %s" % tapName, shell=True)
-    subprocess.call("ip link set %s up" % tapName, shell=True)
-
-    subprocess.call("brctl addif %s %s" % (brname, tapName), shell=True)
-
-    ofile.write("\nip link del %s\n" % tapName)
-
-    return tapName
+    create_tap_process = subprocess.Popen(command_to_execute, shell=True, stdout=subprocess.PIPE)
+    create_tap_process.wait()
+    if create_tap_process.returncode == 0:
+        out_file.write("\nip link del %s\n" % tap_name)
+        return tap_name
+    else:
+        return None
 
 
-def createVR(myGINI, options):
-    "create router config file, and start the router"
-
-    routerDir = options.routerDir
-    switchDir = options.switchDir
-    # create the main router directory
-    makeDir(routerDir)
-    for router in myGINI.vr:
-        print "Starting %s...\t" % router.name,
+def create_virtual_routers(gini, opts):
+    """Create router config file, and start the router"""
+    routerDir = opts.routerDir
+    make_dir(routerDir)
+    for router in gini.vr:
+        print "\tStarting %s...\t" % router.name,
         sys.stdout.flush()
-        ### ------ config ---------- ###
         # name the config file
         subRouterDir = "%s/%s" % (routerDir, router.name)
-        makeDir(subRouterDir)
+        make_dir(subRouterDir)
         # go to the router directory to execute the command
         oldDir = os.getcwd()
         os.chdir(subRouterDir)
-        configFile = "%s.conf" % GR_PROG
+        configFile = "%s.conf" % GROUTER_PROGRAM
         # delete confFile if already exists
-        if (os.access(configFile, os.F_OK)):
+        if os.access(configFile, os.F_OK):
             os.remove(configFile)
         # create the config file
         configOut = open(configFile, "w")
         stopOut = open("stopit.sh", "w")
         stopOut.write("#!/bin/bash\n")
 
+        interfaces_map = dict()
+
         for nwIf in router.netIF:
-            swname = nwIf.target
-            print "Checking switch: " + swname
-            if not checkSwitch(myGINI, swname):
-                print "It is not a switch..."
-                # Router could be conected to a machine
-                if checkRouter(myGINI, swname):
+            target_name = nwIf.target
+            switch = check_switch(gini, target_name)
+            if not switch:
+                interface_name = "%s - %s" % (router.name, target_name)
+                # Router could be connected to a machine
+                if check_router(gini, target_name):
                     print "It is a router at the other end."
                     # Check whether the other router has already created the hidden switch
                     # If so, this router can just tap into it
-                    x,rnum = router.name.split("_")
-                    x,snum = swname.split("_")
+                    x, rnum = router.name.split("_")
+                    x, snum = target_name.split("_")
                     scheck = "Switch_r%sr%s" % (snum, rnum)
-                    brname = findBridgeName(scheck)
-                    if (brname == None):
-                        swname, brname = createASwitch(router.name, swname, nwIf.network, stopOut)
-                        if swname == None:
+                    bridge_name, is_ovs = find_bridge_name(scheck)
+                    if bridge_name is None:
+                        switch_name, bridge_name = create_new_switch(router.name, target_name, nwIf.network, stopOut)
+                        if target_name is None:
                             print "[Failed]"
                             return False
                 else:
                     # We are connected to a machine
-
-                    swname, brname = createASwitch(router.name, swname, nwIf.network, stopOut)
-                    if swname == None:
+                    switch_name, bridge_name = create_new_switch(router.name, target_name, nwIf.network, stopOut)
+                    if target_name is None:
                         print "[Failed]"
                         return False
+                is_ovs = False
             else:
-                brname = findBridgeName(swname)
-            tapname = setupTapInterface(router.name, swname, brname, stopOut)
-            if (tapname == "None"):
+                bridge_name, is_ovs = find_bridge_name(target_name)
+                interface_name = target_name
+                is_ovs = switch.isOVS
+            tapname = set_up_tap_interface(router.name, target_name, bridge_name, stopOut, is_ovs)
+            if tapname is None:
                 print "[Failed]"
-                print "\nRouter %s: unable to create tap interface"  % router.name
+                print "\nRouter %s: unable to create tap interface" % router.name
                 return False
             else:
-                configOut.write(getVRIFOutLine(nwIf, tapname))
+                configOut.write(get_virtual_router_interface_outline(nwIf, tapname))
+                interfaces_map[interface_name] = bridge_name
         configOut.write("echo -ne \"\\033]0;" + router.name + "\\007\"")
         configOut.close()
         stopOut.close()
         ### ------- commands to execute ---------- ###
-        command = "screen -d -m -L -S %s %s " % (router.name, GR_PROG_BIN)
-        command += "--config=%s.conf " % GR_PROG
+        command = "screen -d -m -L -S %s %s " % (router.name, GROUTER_PROGRAM_BIN)
+        command += "--config=%s.conf " % GROUTER_PROGRAM
         command += "--confpath=" + os.environ["GINI_HOME"] + "/data/" + router.name + " "
         command += "--interactive=1 "
-
-        if router.openFlowController:
-            command += "--openflow="
-            for controller in myGINI.vofc:
-                for r in controller.routers:
-                    if r == router.name:
-                        port = None
-                        try:
-                            # Determine PID of controller and find the netstat entry associated with that PID
-                            print "%s/%s/%s.pid" % (options.controllerDir, controller.name, controller.name)
-                            pid_file = open("%s/%s/%s.pid" % (options.controllerDir, controller.name, controller.name), "r")
-                            cmd = "netstat -tlpn | egrep %s/" % pid_file.read().strip()
-
-                            process = subprocess.Popen(cmd, shell=True,
-                                                       stdout=subprocess.PIPE,
-                                                       stderr=subprocess.PIPE)
-                            out = process.stdout.read().strip()
-                            if out == "":
-                                raise StandardError()
-                            pid_file.close()
-                            process.stdout.close()
-
-                            # Get TCP port number from netstat entry
-                            regex = re.compile("^.+:([0-9]+)[^0-9].*$")
-                            matches = regex.match(out)
-                            if matches and len(matches.groups()) == 1:
-                                port = matches.group(1)
-                            else:
-                                raise StandardError()
-                        except StandardError as e:
-                            print "[Failed]"
-                            print "Failed to identify OpenFlow controller TCP port"
-                            return False
-
-                        # Pass controller port number to router so that router can connect to controller
-                        command += port + " "
-
+        command += "--verbose=0 "
         command += "%s" % router.name
-        #print command
+
         startOut = open("startit.sh", "w")
         startOut.write(command)
         startOut.close()
-        os.chmod("startit.sh",0755)
-        os.chmod("stopit.sh",0755)
+        os.chmod("startit.sh", 0755)
+        os.chmod("stopit.sh", 0755)
 
         system("./startit.sh")
-        print "[OK]",
-        if router.openFlowController:
-            print " (OF port: " + port + ")",
-        print ""
-        os.chdir(oldDir)
 
+        # Write switch names and the corresponding bridges for Wireshark
+        router_tmp_file = GINI_TEMP_DIR + router.name + ".json"
+        with open(router_tmp_file, "w") as f:
+            f.write(json.dumps(interfaces_map, sort_keys=True, indent=2))
+
+        print "[OK]"
+        os.chdir(oldDir)
 
     return True
 
 
-def getDockerNetworkName(switch_name):
-    if dockerNetworkNameMap.get(switch_name):
-        return dockerNetworkNameMap[switch_name]
+def get_network_name(switch_name):
+    if network_name_map.get(switch_name):
+        return network_name_map[switch_name]
     else:
         return switch_name
 
 
-def checkSwitch(myGINI, name):
-
-    for switch in myGINI.switches:
-        if switch.name == name:
-            return True
-    return False
-
-
-def checkRouter(myGINI, name):
-
-    for vr in myGINI.vr:
-        if vr.name == name:
-            return True
-    return False
+def check_switch(gini, switch_name):
+    for switch in gini.switches:
+        if switch.name == switch_name:
+            return switch
+    return None
 
 
-def  getSwitch2Connect(myGINI, uml):
+def check_router(gini, router_name):
+    for router in gini.vr:
+        if router.name == router_name:
+            return router
+    return None
+
+
+def get_switch_to_connect(gini, host):
     # one of the interfaces is
-    for nwi in uml.interfaces:
+    for nwi in host.interfaces:
         target = nwi.target
-        if checkSwitch(myGINI, target):
-            return getDockerNetworkName(target), nwi.ip
-
-    for nwi in uml.interfaces:
-        target = nwi.target
-        if checkRouter(myGINI, target):
+        if check_switch(gini, target):
+            return get_network_name(target), nwi.ip, nwi.mac
+        elif check_router(gini, target):
             # create a 'hidden' switch because docker needs a
             # switch to connect to the router
-            swname = findHiddenSwitch(target, uml.name)
-            return getDockerNetworkName(swname), nwi.ip
+            swname = find_hidden_switch(target, host.name)
+            return get_network_name(swname), nwi.ip, nwi.mac
 
-    return ""
-#end - getSwitch2Connect
+    return None, None, None
 
+def create_entrypoint_script(mach, ip):
+    ostr = ""
 
+    if mach.os == "glinux":
+        ostr +="#!/bin/ash\n\n"
+    else:
+        ostr += "#!/bin/bash\n\n"
 
-def createVM(myGINI, options):
-    "create UML config file, and start the UML"
+    for nwIf in mach.interfaces:
+        for route in nwIf.routes:
+            entry_command = "route add -%s %s " % (route.type, route.dest)
+            entry_command += "netmask %s " % route.netmask
+            if route.gw:
+                entry_command += "gw %s " % route.gw
+            ostr += entry_command + "\n"
 
-    makeDir(options.umlDir)
+    # Export command prompt for VM, start shell inside docker container
+    ostr += "\ncd /root\n"    
+    ostr += "\nif [ -e run.sh ]; then\n\t./run.sh \nfi\n"    
+    if mach.os == "glinux":
+        ostr += "\nexport PS1='GL:root@%s >> '\n" % ip
+        ostr += "/bin/ash\n"        
+    elif mach.os == "buster":
+        ostr += "\necho \"export PS1='DB:root@%s >> '\" > .bashrc \n" % ip
+        ostr += "/bin/bash\n"
+    else:
+        ostr += "\necho \"export PS1='JS:root@%s >> '\" > .bashrc \n" % ip
+        ostr += "/bin/bash\n"    
 
-    print ">>>>>>>>>>>>>> Start >>>>>"
+    return ostr
 
-    for uml in myGINI.vm:
-        print "Starting %s...\t" % uml.name,
-        subUMLDir = "%s/%s" % (options.umlDir, uml.name)
-        makeDir(subUMLDir)
+def create_docker_run_cmdline(mach, is_ovs, mac, ip, switch_name):
+    ostr = ""
+    # create command line
+    ostr = "docker run -it --detach --privileged --name %s --hostname %s  " % (mach.name, mach.name)
+    ostr += "-v %s/data/%s:/root " % (os.environ["GINI_HOME"], mach.name)
+    ostr += "--entrypoint /root/entrypoint.sh "
+    if not is_ovs:
+        ostr += "--mac-address %s " % mac
+        ostr += "--network %s " % switch_name
+        ostr += "--ip %s " % ip
+    if mach.os == "glinux":
+        ostr += "citelab/glinux:latest /bin/ash > /dev/null &&\n"                
+    elif mach.os == "buster":
+        ostr += "citelab/buster:latest /bin/bash > /dev/null &&\n"
+    else:
+        ostr += "citelab/jessie:latest /bin/bash > /dev/null &&\n"            
+    
+    return ostr
+
+def create_virtual_machines(gini, opts):
+    """create Mach config file, and start the Mach"""
+    make_dir(opts.machDir)
+    for mach in gini.vm:
+        print "\tStarting %s...\t" % mach.name,
+        sub_mach_dir = "%s/%s" % (opts.machDir, mach.name)
+        make_dir(sub_mach_dir)
 
         # Store current and go into the sub directory...
-        oldDir = os.getcwd()
-        os.chdir(subUMLDir)
+        old_dir = os.getcwd()
+        os.chdir(sub_mach_dir)
 
-        # Write an init script to run at docker startup
-        startOut = open("entrypoint.sh", "w")
-        startOut.write("#!/bin/ash\n\n")
-        for nwIf in uml.interfaces:
-            for route in nwIf.routes:
-                command = "route add -%s %s " % (route.type, route.dest)
-                command += "netmask %s " % route.netmask
-                if route.gw:
-                    command += "gw %s " % route.gw
-                startOut.write(command + "\n")
-            #end each route
-        #end each interface
+        switch_name, ip, mac = get_switch_to_connect(gini, mach)
 
-        stopOut = open("stopit.sh", "w")
-        stopOut.write("#!/bin/bash\n")
-        # Get switch to connect
-        print "Before get "
-        sname, ip = getSwitch2Connect(myGINI, uml)
+        if switch_name is not None:
+            is_ovs = False
+            if switch_name[:3] == "OVS":
+                is_ovs = True
 
-        # Export command prompt for VM, start shell inside docker container
-        startOut.write("\nexport PS1='root@%s >> '\n" % ip)
-        startOut.write("/bin/ash\n")
-        startOut.close()
-        os.chmod("entrypoint.sh", 0755)
+            # entry script for docker container
+            entrypoint_script = open("entrypoint.sh", "w")
+            entrypoint_script.write(create_entrypoint_script(mach, ip))
+            entrypoint_script.close()
+            os.chmod("entrypoint.sh", 0755)
 
-        print "Sname " + sname + " IP " + ip
-        baseScreenCommand = "screen -d -m -L -S %s " % uml.name
+            # Startup script that used by host to actually start docker containers via screen
+            start_script_path = "./.startit.sh"
+            start_script = open(start_script_path, "w")
+            start_script.write("#!/bin/bash\n\n")
 
-        if (sname != "fail"):
-            # create command line
-            command = "docker run -i --privileged --name %s " % uml.name
-            command += "-v %s/data/%s:/root " % (os.environ["GINI_HOME"], uml.name)
-            command += "--entrypoint /root/entrypoint.sh -it "
-            command += "--network %s " % sname
-            command += "--ip %s" % ip
-            command += " alpine "
+            # Script for safely terminating the machine
+            stop_script_path = "./.stopit.sh"
+            stop_out = open(stop_script_path, "w")
+            stop_out.write("#!/bin/bash\n")  
+            start_script.write(create_docker_run_cmdline(mach, is_ovs, mac, ip, switch_name))
 
-            print "<<<<<<< " + baseScreenCommand + command
+            if is_ovs:
+                ovs_connect_command = "ovs-docker add-port %s eth1 %s --ipaddress=%s/24 --macaddress=%s &&\n" \
+                                      % (switch_name, mach.name, ip, mac)
+                start_script.write(ovs_connect_command)
+                rerun_entrypoint_command = "docker exec %s /root/entrypoint.sh &&\n" % mach.name
+                start_script.write(rerun_entrypoint_command)
+                ovs_disconnect_command = "ovs-docker del-port %s eth1 %s\n" % (switch_name, mach.name)
+                stop_out.write(ovs_disconnect_command)
 
-            runcmd = subprocess.Popen(baseScreenCommand + command, shell=True, stdout=subprocess.PIPE)
-            out,err = runcmd.communicate()
+            stop_out.write("docker kill %s\n" % mach.name)
+            stop_out.write("docker rm %s\n\n" % mach.name)
 
-            if runcmd.returncode == 0:
-                stopOut.write("docker kill %s\n\n" % uml.name)
-                stopOut.write("docker rm %s\n\n" % uml.name)
-                stopOut.close()
+            docker_detach_command = "docker attach %s\n" % mach.name
+            start_script.write(docker_detach_command)
+
+            base_screen_command = "screen -d -m -L -S %s " % mach.name
+
+            start_script.close()
+            os.chmod(start_script_path, 0755)
+
+            runcmd = subprocess.Popen(base_screen_command + start_script_path, shell=True, stdout=subprocess.PIPE)
+            runcmd.communicate()
+            if runcmd.returncode != 0:
+                stop_out.close()
+                os.chmod(stop_script_path, 0755)
+                system(stop_script_path)
+                print "[Failed] Error when creating Docker container"
+                return False
         else:
-            print "No Target found for Machine: %s " % uml.name
+            print "[Failed] No Target found for Machine: %s " % mach.name
             return False
 
         print "[OK]"
 
-        stopOut.close()
-        os.chmod("stopit.sh",0755)
+        stop_out.close()
+        os.chmod(stop_script_path, 0755)
         # Restore the old directory...
-        os.chdir(oldDir)
+        os.chdir(old_dir)
 
     return True
 
-def createVOFC(myGINI, options):
-    "create OpenFlow controller config file, and start the OpenFlow controller"
-    makeDir(options.controllerDir);
-    for controller in myGINI.vofc:
-        print "Starting OpenFlow controller %s...\t" % controller.name,
-        subControllerDir = "%s/%s" % (options.controllerDir, controller.name)
-        makeDir(subControllerDir)
+
+def check_port_available(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(("0.0.0.0", port))
+    if result == 0:
+        return False
+    else:
+        return True
+
+
+def find_available_port(lower_range, upper_range):
+    for port in range(lower_range, upper_range+1):
+        if check_port_available(port):
+            return port
+    return -1
+
+
+def create_cloud(gini, opts):
+    """Creates cloud instance with a proxy"""
+    # make_dir(opts.cloud_dir)
+    for cloud in gini.clouds:
+        print "\tStarting %s ...\t" % cloud.name,
+        sub_cloud_dir = "%s/%s" % (opts.cloud_dir, cloud.name)
+        print sub_cloud_dir
+        make_dir(sub_cloud_dir)
+
+        # Store current and go into the subdirectory
+        old_dir = os.getcwd()
+        os.chdir(sub_cloud_dir)
+
+        switch_name, ip, mac = get_switch_to_connect(gini, cloud)
+
+        if switch_name is not None:
+            if 'ovs' in switch_name.lower():
+                ovs = True
+            else:
+                ovs = False
+
+            gini_network = cloud.interfaces[0].routes[0].dest
+            gini_netmask = cloud.interfaces[0].routes[0].netmask
+
+            entrypoint_script = "%s/entrypoint.sh" % sub_cloud_dir
+
+            cloud_config = {
+                "subnet": "%s/24" % cloud.interfaces[0].network,      # hacky. TODO: remove the hardcoded 24
+                "network_name": switch_name,
+                "proxy_ip": cloud.interfaces[0].ip,
+                "gateway_ip": cloud.interfaces[0].routes[0].gw,
+                "entrypoint": entrypoint_script,
+                "ovs": ovs
+            }
+
+            with open(entrypoint_script, "w") as f:
+                f.write("#!/bin/dumb-init /bin/sh\n\n")
+                # add routes before running the actual entrypoint
+                f.write("ip route add %s/%s via %s\n"
+                        % (gini_network, gini_netmask, cloud_config["gateway_ip"]))
+                f.write('docker-entrypoint.sh "$@"\n')
+            os.chmod(entrypoint_script, 0755)
+
+            config_file_path = "%s/config.json" % sub_cloud_dir
+            with open(config_file_path, "w") as f:
+                f.write(json.dumps(cloud_config))
+            rest_api_port = find_available_port(15000, 16000)
+            if rest_api_port == -1:
+                print "[FAILED] Cannot find an unused port for the REST server"
+                return False
+
+            screen_command = "screen -d -m -L -S %s " % cloud.name
+            docker_command = "docker run -it --rm --privileged --network host " \
+                             "-v /var/run/docker.sock:/var/run/docker.sock " \
+                             "-v /var/run/openvswitch/:/var/run/openvswitch/ " \
+                             "-v /var/run/netns:/var/run/netns " \
+                             "-v /proc:/proc " \
+                             "-v %s:/code/config.json " \
+                             "-v %s:%s " \
+                             "--name cloud-manager-%s " \
+                             "citelab/simplecloud:latest " \
+                             "python main.py -f /code/config.json " \
+                             "--rest-port %d" % (config_file_path, entrypoint_script,
+                                                 entrypoint_script, switch_name,
+                                                 rest_api_port)
+
+            runcmd = subprocess.Popen(screen_command + docker_command, shell=True, stdout=subprocess.PIPE)
+            runcmd.communicate()
+            if runcmd.returncode != 0:
+                print "[Failed] Error when creating simple cloud"
+                return False
+        else:
+            print "[Failed] No target found for Cloud: %s" % cloud.name
+            return False
+
+        print "[OK]"
+        os.chdir(old_dir)
+
+    return True
+
+
+def create_openflow_controllers(gini, opts):
+    """Create OpenFlow controller config file, and start the OpenFlow controller"""
+    make_dir(opts.controllerDir)
+    for controller in gini.vofc:
+        print "\tStarting OpenFlow controller %s...\t" % controller.name,
+        subControllerDir = "%s/%s" % (opts.controllerDir, controller.name)
+        make_dir(subControllerDir)
+
+        port = find_available_port(6633, 6653)
+        if port == -1:
+            print "[FAILED] Cannot find an unused port"
+            return False
 
         vofcFlags = "py "
-        vofcFlags += "openflow.of_01 --port=0 "
-        vofcFlags += "gini.support.gini_pid --pid_file_path='%s/%s/%s.pid' " % (options.controllerDir, controller.name, controller.name)
-        vofcFlags += "gini.support.gini_module_load --module_file_path='%s/%s/%s.modules' " % (options.controllerDir, controller.name, controller.name)
+        vofcFlags += "openflow.of_01 --address=0.0.0.0 --port=%d " % port
+        vofcFlags += "gini.core.forwarding_l2_pairs "
+        vofcFlags += "gini.support.gini_pid --pid_file_path='%s/%s/%s.pid' " % (opts.controllerDir, controller.name, controller.name)
+        vofcFlags += "gini.support.gini_module_load --module_file_path='%s/%s/%s.modules' " % (opts.controllerDir, controller.name, controller.name)
 
-        print "------------------------------------"
-        print "VOFC: " + vofcFlags
-        print "------------------------------------"
+        command = "screen -d -m -L -S %s %s %s\n\n" % (controller.name, OPENFLOW_CONTROLLER_PROGRAM_BIN, vofcFlags)
 
+        connect_commands = ""
+        for ovs in controller.open_virtual_switches:
+            connect_commands += "ovs-vsctl set-controller %s tcp:0.0.0.0:%d\n" % (ovs, port)
 
-        command = "screen -d -m -L -S %s %s %s" % (controller.name, VOFC_PROG_BIN, vofcFlags)
-
-        oldDir = os.getcwd()
+        old_dir = os.getcwd()
         os.chdir(subControllerDir)
         startOut = open("startit.sh", "w")
         startOut.write(command)
+        startOut.write(connect_commands)
         startOut.close()
-        os.chmod("startit.sh",0755)
+        os.chmod("startit.sh", 0755)
         system("./startit.sh")
+        os.chdir(old_dir)
         print "[OK]"
     return True
 
-def createVMB(myGINI, options):
-    "create UML config file, and start the UML"
-    baseDir = os.environ["GINI_HOME"] + "/data/uml_virtual_switch"
-    makeDir(baseDir)
-    makeDir(options.umlDir)
-    oldDir = os.getcwd()
-    del nodes[:]
-    for mobile in myGINI.vmb:
-        print "Starting virtual Switch for Mobile %s...\t" % mobile.name,
-        #print nodes
-        nodes.append(mobile.name)
-        node = len(nodes)
-        subUMLDir = baseDir+"/VS_%d" % node
-        makeDir(subUMLDir)
-        os.chdir(subUMLDir)
-#        vsconf = open("uswitch.conf", "w")
-#        vsconf.write("logfile uswitch.log\npidfile uswitch.pid\nsocket gw_socket.ctl\nfork\n")
-#        vsconf.close()
-        popen("%s -s gw_socket.ctl -l uswitch.log -p uswitch.pid&" % VS_PROG)
-        print "[OK]"
 
-        print "Starting Mobile %s...\t" % mobile.name,
-        # create command line
-        command = createUMLCmdLine(mobile)
-
-        for nwIf in mobile.interfaces:
-            socketName = subUMLDir + "/gw_socket.ctl"
-            # create the config file in /tmp and
-            # return a line to be added in the command
-            outLine = getVMIFOutLine(nwIf, socketName, mobile.name)
-            if (outLine):
-                command += "%s " % outLine
-            else:
-                print "[FAILED]"
-                return False
-        ### ------- execute ---------- ###
-        # go to the UML directory to execute the command
-        makeDir(options.umlDir+"/"+mobile.name)
-        os.chdir(options.umlDir+"/"+mobile.name)
-        startOut = open("startit.sh", "w")
-        startOut.write(command)
-        startOut.close()
-        os.chmod("startit.sh",0755)
-        system("./startit.sh")
-        #print command
-        print "[OK]"
-        os.chdir(oldDir)
-    return True
-
-def createVRM(myGINI, options):
-    "create REALM config file, and start the REALM"
-    makeDir(options.umlDir)
-    for realm in myGINI.vrm:
-        print "Starting REALM %s...\t" % realm.name,
-        subUMLDir = "%s/%s" % (options.umlDir, realm.name)
-        makeDir(subUMLDir)
-        # create command line
-        command = createUMLCmdLine(realm)
-        ### ---- process the UML interfaces ---- ###
-        # it creates one config for each interface in the /tmp/ directory
-        # and returns a string to be attached to the UML exec command line
-        for nwIf in realm.interfaces:
-            # check whether it is connecting to a switch or router
-            socketName = getSocketName(nwIf, realm.name, myGINI, options);
-            if (socketName == "fail"):
-                print "REALM %s [interface %s]: Target not found" % (realm.name, nwIf.name)
-                return False
-            else:
-                # create the config file in /tmp and
-                # return a line to be added in the command
-                outLine = getVMIFOutLine(nwIf, socketName, realm.name)
-            if (outLine):
-                command += "%s " % outLine
-            else:
-                print "[FAILED]"
-                return False
-        ### ------- execute ---------- ###
-        # go to the UML directory to execute the command
-
-            oldDir = os.getcwd()
-            # os.chdir(subUMLDir)
-            # startOut = open("startit.sh", "w")
-            # startOut.write(command)
-            # startOut.close()
-            # os.chmod("startit.sh",0755)
-            # system("./startit.sh")
-            # os.chdir(os.environ["GINI_SHARE"]+"/vgini")
-            vtap = "screen -d -m -S %s-vtap vtap" % realm.name
-            print vtap
-            system(vtap)
-            vtproxy = "screen -d -m -S %s-vtproxy vtproxy %s %s %s" % (realm.name, nwIf.ip, nwIf.mac, socketName)
-            print vtproxy
-            system(vtproxy)
-            print "[OK]"
-            os.chdir(oldDir)
-    return True
-
-def makeDir(dirName):
-    "create a directory if not exists"
-    if (not os.access(dirName, os.F_OK)):
-        os.mkdir(dirName, 0755)
+def make_dir(dir_name):
+    """create a directory if not exists"""
+    if not os.access(dir_name, os.F_OK):
+        os.mkdir(dir_name, 0755)
     return
 
-
-
-#########################
-# TO DELETE
-# After making it no use from other functions
-#########################
 
 # socket name is defined as:
 # for switch: switchDir/switchName/SOCKET_NAME.ctl
 # for router: routerDir/routerName/SOCKET_NAME_interfaceName.ctl
 # the socket names are fully qualified file names
-def getSocketName(nwIf, name, myGINI, options):
-    "Get the socket name the interface is connecting to"
-    waps = myGINI.vwr
-    for wap in waps:
-        print wap
-        # looking for a match in all waps
-        if (wap.name == nwIf.target):
-            oldDir = os.getcwd()
-            switch_sharing = False
-            for i in range(len(nodes)):
-                if (nodes[i].find("UML_")+nodes[i].find("REALM_")) >= 0:
-                    switch_sharing = True
-                    break
-            nodes.append(name)
-            if switch_sharing:
-                newDir = os.environ["GINI_HOME"] + "/data/uml_virtual_switch/VS_%d" % (i+1)
-            else:
-                newDir = os.environ["GINI_HOME"] + "/data/uml_virtual_switch/VS_%d" % len(nodes)
-                system("mkdir %s" % newDir)
-                os.chdir(newDir)
-                configOut = open("uswitch.conf", "w")
-                configOut.write("logfile uswitch.log\npidfile uswitch.pid\nsocket gw_socket.ctl\nfork\n")
-                configOut.close()
-                popen("%s -s %s -l uswitch.log -p uswitch.pid &" % (VS_PROG, newDir+"/gw_socket.ctl"))
-                os.chdir(oldDir)
-            #else:
-                #newDir = os.environ["GINI_HOME"] + "/bin/uml_virtual_switch/VS_%d" % len(nodes)
-            return newDir + "/gw_socket.ctl"
-
-    routers = myGINI.vr
+def get_socket_name(network_interface, name, gini, opts):
+    """Get the socket name the interface is connecting to"""
+    routers = gini.vr
     for router in routers:
         # looking for a match in all routers
-        if (router.name == nwIf.target):
+        if router.name == network_interface.target:
             for remoteNWIf in router.netIF:
                 # router matches, looking for a reverse match
-                #print remoteNWIf.target, name
-                if (remoteNWIf.target == name):
-                    # all match create and return the socketname
-                    targetDir = getFullyQualifiedDir(options.routerDir)
+                # print remoteNWIf.target, name
+                if remoteNWIf.target == name:
+                    # all match create and return the socket name
+                    targetDir = get_fully_qualified_dir(opts.routerDir)
                     return "%s/%s/%s_%s.ctl" % \
-                           (targetDir, router.name, \
+                           (targetDir, router.name,
                             SOCKET_NAME, remoteNWIf.name)
             # router matches, but reverse match failed
             return "fail"
-    switches = myGINI.switches
+    switches = gini.switches
     for switch in switches:
-        if (switch.name == nwIf.target):
-            targetDir = getFullyQualifiedDir(options.switchDir)
+        if switch.name == network_interface.target:
+            targetDir = get_fully_qualified_dir(opts.switchDir)
             return "%s/%s/%s.ctl" % \
                    (targetDir, switch.name, SOCKET_NAME)
-    umls = myGINI.vm
-    for uml in umls:
-        if (uml.name == nwIf.target):
-            # target matching a UML; UML can't create sockets
+    machs = gini.vm
+    for mach in machs:
+        if mach.name == network_interface.target:
+            # target matching a Mach; Mach can't create sockets
             # so return value is socket name of the current router
-            targetDir = getFullyQualifiedDir(options.routerDir)
+            targetDir = get_fully_qualified_dir(opts.routerDir)
             return "%s/%s/%s_%s.ctl" % \
-                   (targetDir, name, SOCKET_NAME, nwIf.name)
+                   (targetDir, name, SOCKET_NAME, network_interface.name)
 
-    realms = myGINI.vrm
-    for realm in realms:
-        if (realm.name == nwIf.target):
-            targetDir = getFullyQualifiedDir(options.routerDir)
-            return "%s/%s/%s_%s.ctl" % \
-                       (targetDir, name, SOCKET_NAME, nwIf.name)
     return "fail"
 
-def getFullyQualifiedDir(dirName):
-    "get a fully qualified name of a directory"
-    targetDir = ""
-    if (dirName[0] == '/'):
+
+def get_fully_qualified_dir(dir_name):
+    """Get a fully qualified name of a directory"""
+    if dir_name[0] == '/':
         # absolute path
-        targetDir = dirName
-    elif (dirName[0] == '.'):
+        target_dir = dir_name
+    elif dir_name[0] == '.':
         # relative to the current path
-        if (len(dirName) > 1):
-            targetDir = "%s/%s" % (os.getcwd(), dirName[1:])
+        if len(dir_name) > 1:
+            target_dir = "%s/%s" % (os.getcwd(), dir_name[1:])
         else:
             # just current path
-            targetDir = os.getcwd()
+            target_dir = os.getcwd()
     else:
         # relative path
-        targetDir = "%s/%s" % (os.getcwd(), dirName)
-    return targetDir
+        target_dir = "%s/%s" % (os.getcwd(), dir_name)
+    return target_dir
 
-def getVRIFOutLine(nwIf, intName):
-    "convert the router network interface specs into a string"
-    outLine = "ifconfig add %s " % intName
-    outLine += "-addr %s " % nwIf.ip
+
+def get_virtual_router_interface_outline(network_interface, interface_name):
+    """Convert the router network interface specs into a string"""
+    outLine = "ifconfig add %s " % interface_name
+    outLine += "-addr %s " % network_interface.ip
     # TODO: address the "no network" attrib in VR IF DTD
-    # outLine += "-network %s " % nwIf.network
-    outLine += "-hwaddr %s " % nwIf.nic
+    # outLine += "-network %s " % network_interface.network
+    outLine += "-hwaddr %s " % network_interface.nic
     # TODO: address the "no gw" attrib in VR IF DTD
-    if (nwIf.gw):
-        outLine += "-gw %s " % nwIf.gw
-    if (nwIf.mtu):
-        outLine += "-mtu %s " % mwIf.mtu
+    if network_interface.gw:
+        outLine += "-gw %s " % network_interface.gw
+    if network_interface.mtu:
+        outLine += "-mtu %s " % network_interface.mtu
     outLine += "\n"
-    for route in nwIf.routes:
-        outLine += "route add -dev %s " % intName
+    for route in network_interface.routes:
+        outLine += "route add -dev %s " % interface_name
         outLine += "-net %s " % route.dest
         outLine += "-netmask %s " % route.netmask
-        if (route.nexthop):
+        if route.nexthop:
             outLine += "-gw %s" % route.nexthop
         outLine += "\n"
     return outLine
 
-def getVMIFOutLine(nwIf, socketName, name):
-    "convert the UML network interface specs into a string"
-    configFile = "%s/tmp/%s.sh" % (os.environ["GINI_HOME"], nwIf.mac.upper())
+
+def get_virtual_machine_interface_outline(network_interface, socketName, name):
+    """convert the Mach network interface specs into a string"""
+    configFile = "%s/tmp/%s.sh" % (os.environ["GINI_HOME"], network_interface.mac.upper())
     # delete confFile if already exists
     # also checks whether somebody else using the same MAC address
-    if (os.access(configFile, os.F_OK)):
-        if (os.access(configFile, os.W_OK)):
+    if os.access(configFile, os.F_OK):
+        if os.access(configFile, os.W_OK):
             os.remove(configFile)
         else:
-            print "Can not create config file for %s" % nwIf.name
+            print "Can not create config file for %s" % network_interface.name
             print "Probably somebody else is using the same ",
-            print "MAC address %s" % nwIf.mac
+            print "MAC address %s" % network_interface.mac
             return None
     # create the config file
     configOut = open(configFile, "w")
-    if nwIf.ip:
-        configOut.write("ifconfig %s " % nwIf.name)
-        configOut.write("%s " % nwIf.ip)
-        for route in nwIf.routes:
+    if network_interface.ip:
+        configOut.write("ifconfig %s " % network_interface.name)
+        configOut.write("%s " % network_interface.ip)
+        for route in network_interface.routes:
             if route.dest:
                 configOut.write("\nroute add -%s %s " % (route.type, route.dest))
             configOut.write("netmask %s " % route.netmask)
@@ -913,267 +808,155 @@ def getVMIFOutLine(nwIf, socketName, name):
     configOut.write("echo -ne \"\\033]0;" + name + "\\007\"")
     configOut.close()
     os.chmod(configFile, 0777)
-    bakDir = "%s/tmp/UML_bak" % os.environ["GINI_HOME"]
+    bakDir = "%s/tmp/Mach_bak" % os.environ["GINI_HOME"]
     if not os.access(bakDir, os.F_OK):
-        makeDir(bakDir)
+        make_dir(bakDir)
     system("cp %s %s" % (configFile, bakDir))
     # prepare the output line
-    outLine = "%s=daemon,%s,unix," % (nwIf.name, nwIf.mac)
+    outLine = "%s=daemon,%s,unix," % (network_interface.name, network_interface.mac)
     outLine += socketName
     return outLine
 
-def createUMLCmdLine(uml):
-    command = "screen -d -m -S %s " % uml.name
-    ## uml binary name
-    if (uml.kernel):
-        command += "%s " % uml.kernel
-    else:
-        command += "%s " % VM_PROG_BIN
-    ## uml ID
-    command += "umid=%s " % uml.name
-    ## handle the file system option
-    # construct the cow file name
-    fileSystemName = getBaseName(uml.fileSystem.name)
-    fsCOWName = os.environ["GINI_HOME"] + "/data/" + uml.name + "/" + fileSystemName + ".cow"
-    if (uml.fileSystem.type.lower() == "cow"):
-        command += "ubd0=%s,%s " % (fsCOWName, os.environ["GINI_SHARE"] + "/filesystem/" + fileSystemName)
-    else:
-        command += "ubd0=%s " % uml.fileSystem.name
-    ## handle the mem option
-    if (uml.mem):
-        command += "mem=%s " % uml.mem
-    ## handle the boot option
-    if (uml.boot):
-        command += "con0=%s " % uml.boot
-    command += "hostfs=%s " % os.environ["GINI_HOME"]
-    return command
 
-def getBaseName(pathName):
-    "Extract the filename from the full path"
-    pathParts = pathName.split("/")
-    return pathParts[len(pathParts)-1]
+def get_base_name(path_name):
+    """Extract the filename from the full path"""
+    path_parts = path_name.split("/")
+    return path_parts[-1]
 
-def destroyGINI(myGINI, options):
+
+def destroy_GINI(gini, opts):
     result = True
 
-    tapNameMap.clear()
-    subnetMap.clear()
-    dockerNetworkNameMap.clear()
+    tap_interface_names_map.clear()
+    subnet_map.clear()
+    network_name_map.clear()
 
     try:
-        print "\nTerminating UMLs..."
-        result = result and  destroyVM(myGINI.vm, options.umlDir, 0)
+        print "\nTerminating Machs..."
+        result = result and destroy_virtual_machines(gini.vm, opts.machDir, 0)
+
+        print "\nTerminating Clouds..."
+        result = result and destroy_clouds(gini.clouds)
+
+        system('docker rm -f $(docker ps -aq) 2> /dev/null')
 
         print "\nTerminating routers..."
-        result = result and destroyVR(myGINI.vr, options.routerDir)
+        result = result and destroy_virtual_routers(gini.vr, opts.routerDir)
 
         print "\nTerminating OpenFlow controllers..."
-        result = result and destroyVOFC(myGINI.vofc, options.controllerDir)
+        result = result and destroy_openflow_controllers(gini.vofc, opts.controllerDir)
 
         print "\nTerminating switches..."
-        result = destroyVS(myGINI.switches, options.switchDir)
+        result = destroy_virtual_switches(gini.switches, opts.switchDir)
     except:
-        pass
-
-#    print "\nTerminating wireless access points..."
-#    try:
-#        result = result and destroyVWR(myGINI.vwr, options.routerDir)
-#    except:
-#        pass
-
-#    print "\nTerminating Mobiles..."
-#    try:
-#        result = result and  destroyVM(myGINI.vmb, options.umlDir, 1)
-#    except:
-#        pass
-
-#    print "\nTerminating REALMs..."
-#    try:
-#        result = result and  destroyRVM(myGINI.vrm, options.umlDir)
-#    except:
-#        pass
-    #system("killall uswitch screen")
-    return result
+        result = False
+    finally:
+        return result
 
 
-def destroyVS(switches, switchDir):
+def destroy_virtual_switches(switches, switch_dir):
     for switch in switches:
         print "Stopping Switch %s..." % switch.name
-        command = "%s/%s/stopit.sh" % (switchDir, switch.name)
+        command = "%s/%s/stopit.sh 2>/dev/null" % (switch_dir, switch.name)
         system(command)
     return True
 
-def destroyVWR(wrouters, routerDir):
-    for wrouter in wrouters:
-        print "Stopping Router %s..." % wrouter.name
-        subRouterDir = "%s/%s" % (routerDir, wrouter.name)
-        wrouter.num = wrouter.name.split("Wireless_access_point_")[-1]
-        system("screen -S %s -X eval quit" % ("WAP_%s" % wrouter.num))
-        system("screen -S %s -X eval quit" % ("VWAP_%s" % wrouter.num))
-        print "\tCleaning the directory...\t",
-        try:
-            os.remove(subRouterDir+"/wrouter.conf")
-            #os.remove(subRouterDir+"/startit.sh")
-            while os.access(subRouterDir+"/wrouter.conf", os.F_OK):
-                pass
-            os.rmdir(subRouterDir)
-            print "[OK]"
-        except:
 
-            print "failed"
-            return False
-
-        oldDir = os.getcwd()
-        switchDir = "%s/data/uml_virtual_switch" % os.environ["GINI_HOME"]
-        os.chdir(switchDir)
-        for filename in os.listdir(switchDir):
-            pidfile = filename+"/uswitch.pid"
-            if os.access(pidfile, os.F_OK):
-                pidIn = open(pidfile)
-                line = pidIn.readline().strip()
-                pidIn.close()
-                os.kill(int(line), signal.SIGTERM)
-            while os.access("gw_socket.ctl", os.F_OK):
-                time.sleep(0.5)
-            system("rm -rf %s" % filename)
-
-        os.chdir(oldDir)
-    return True
-
-def destroyVR(routers, routerDir):
+def destroy_virtual_routers(routers, router_dir):
     for router in routers:
         print "Stopping Router %s..." % router.name
         # get the pid file
         print "\tCleaning the PID file...\t",
-        subRouterDir = "%s/%s" % (routerDir, router.name)
+        subRouterDir = "%s/%s" % (router_dir, router.name)
         pidFile = "%s/%s.pid" % (subRouterDir, router.name)
         # check the validity of the pid file
-        pidFileFound = True
-        if (os.access(pidFile, os.R_OK)):
+        pid_file_found = True
+        if os.access(pidFile, os.R_OK):
             # kill the router
-            # routerPID = getPIDFromFile(pidFile)
+            # routerPID = get_pid_from_file(pidFile)
             # os.kill(routerPID, signal.SIGTERM)
             command = "screen -S %s -X quit" % router.name
             system(command)
         else:
-            pidFileFound = False
+            pid_file_found = False
             print "[FAILED]"
-        system("%s/stopit.sh" % subRouterDir)
-
+        system("%s/stopit.sh 2>/dev/null" % subRouterDir)
 
         # clean up the files in the directory
         print "\tCleaning the directory...\t",
-#        if (os.access(subRouterDir, os.F_OK)):
-#            for file in os.listdir(subRouterDir):
-#                fileName = "%s/%s" % (subRouterDir, file)
-#                if (os.access(fileName, os.W_OK)):
-#                    os.remove(fileName)
-#                else:
-#                    print "\n\tRouter %s: Could not delete file %s" % (router.name, fileName)
-#                    print "\tCheck your directory"
-#                    return False
-#            if (os.access(subRouterDir, os.W_OK)):
-#                os.rmdir(subRouterDir)
-#            else:
-#                print "\n\tRouter %s: Could not remove router directory" % router.name
-#                print "\tCheck your directory"
-#                return False
-#        print "[OK]"
-#        if (pidFileFound):
-#            print "\tStopping Router %s...\t[OK]" % router.name
-#        else:
-#            print "\tStopping Router %s...\t[FAILED]" % router.name
-#            print "\tKill the router %s manually" % router.name
-
     return True
 
-def getPIDFromFile(fileName):
-    fileIn = open(fileName)
-    lines = fileIn.readlines()
-    fileIn.close()
+
+def get_pid_from_file(file_name):
+    file_in = open(file_name)
+    lines = file_in.readlines()
+    file_in.close()
     return int(lines[0].strip())
 
-def destroyRVM(umls,umlDir):
-    for uml in umls:
-        print "\tStopping REALM %s...\t[OK]" % uml.name
-        system("screen -S " + uml.name + "-vtap -p 0 -X stuff \"quitt\n\"")
-        system("screen -S " + uml.name + "-vtproxy -X quit")
-        print "\tCleaning the directory...\t",
-        subUMLDir = "%s/%s" % (umlDir, uml.name)
 
-        # TODO: Determine if we need any data in this folder.
-        if (os.access(subUMLDir, os.F_OK)):
-            for file in os.listdir(subUMLDir):
-                fileName = "%s/%s" % (subUMLDir, file)
-                if (os.access(fileName, os.W_OK)):
-                    os.remove(fileName)
-                else:
-                    print "\n\tCould not delete file %s" % (uml.name, fileName)
-                    print "\tCheck your directory"
-                    return False
-            if (os.access(subUMLDir, os.W_OK)):
-                 os.rmdir(subUMLDir)
-        print "[OK]"
-        for nwIf in uml.interfaces:
-            configFile = "%s/tmp/%s.sh" % (os.environ["GINI_HOME"],nwIf.mac.upper())
-            if (os.access(configFile, os.W_OK)):
-                os.remove(configFile)
-    return True
-
-def destroyVM(umls, umlDir, mode):
-
-    for uml in umls:
+def destroy_virtual_machines(machs, machine_dir, mode):
+    for mach in machs:
         # Run the stop command
-        command = "%s/%s/stopit.sh" % (umlDir, uml.name)
+        command = "%s/%s/.stopit.sh 2>/dev/null" % (machine_dir, mach.name)
         system(command)
     return True
 
-def destroyVOFC(controllers, controllerDir):
+
+def destroy_clouds(clouds):
+    for cloud in clouds:
+        system("kill $(ps h --ppid $(screen -ls | grep %s | cut -d. -f1) -o pid) 2>/dev/null" % cloud.name)
+    return True
+
+
+def destroy_openflow_controllers(controllers, controller_dir):
     for controller in controllers:
         print "Stopping OpenFlow controller %s..." % controller.name
         # get the pid file
         print "\tCleaning the PID file...\t",
-        subControllerDir = "%s/%s" % (controllerDir, controller.name)
+        subControllerDir = "%s/%s" % (controller_dir, controller.name)
         pidFile = "%s/%s.pid" % (subControllerDir, controller.name)
         # check the validity of the pid file
         pidFileFound = True
-        if (os.access(pidFile, os.R_OK)):
+        if os.access(pidFile, os.R_OK):
             # kill the controller
             command = "screen -S %s -X quit" % controller.name
+            system(command)
+            command = "kill -9 `cat %s`" % pidFile
             system(command)
         else:
             pidFileFound = False
             print "[FAILED]"
 
         print "\tCleaning the directory...\t",
-        if (os.access(subControllerDir, os.F_OK)):
-            for file in os.listdir(subControllerDir):
-                fileName = "%s/%s" % (subControllerDir, file)
-                if (os.access(fileName, os.W_OK)):
+        if os.access(subControllerDir, os.F_OK):
+            for f in os.listdir(subControllerDir):
+                fileName = "%s/%s" % (subControllerDir, f)
+                if os.access(fileName, os.W_OK):
                     os.remove(fileName)
                 else:
-                    print "\n\OpenFlow controller %s: Could not delete file %s" % (controller.name, fileName)
+                    print "\nOpenFlow controller %s: Could not delete file %s" % (controller.name, fileName)
                     print "\tCheck your directory"
                     return False
-            if (os.access(subControllerDir, os.W_OK)):
+            if os.access(subControllerDir, os.W_OK):
                 os.rmdir(subControllerDir)
             else:
-                print "\n\OpenFlow controller %s: Could not remove directory" % controller.name
+                print "\nOpenFlow controller %s: Could not remove directory" % controller.name
                 print "\tCheck your directory"
                 return False
         print "[OK]"
-        if (pidFileFound):
+        if pidFileFound:
             print "\tStopping OpenFlow controller %s...\t[OK]" % controller.name
         else:
             print "\tStopping OpenFlow controller %s...\t[FAILED]" % controller.name
             print "\tKill the controller %s manually" % controller.name
     return True
 
-def checkProcAlive(procName):
+
+def check_process_alive(process_name):
     alive = False
-    # grep the UML processes
-    system("pidof -x %s > %s" % (procName, GINI_TMP_FILE))
-    inFile = open(GINI_TMP_FILE)
+    # grep the Mach processes
+    system("pidof -x %s > %s" % (process_name, GINI_TEMP_FILE))
+    inFile = open(GINI_TEMP_FILE)
     line = inFile.readline()
     inFile.close()
     if not line:
@@ -1182,8 +965,8 @@ def checkProcAlive(procName):
         procs = line.split()
 
     for proc in procs:
-        system("ps aux | grep %s > %s" % (proc, GINI_TMP_FILE))
-        inFile = open(GINI_TMP_FILE)
+        system("ps aux | grep %s > %s" % (proc, GINI_TEMP_FILE))
+        inFile = open(GINI_TEMP_FILE)
         lines = inFile.readlines()
         inFile.close()
         for line in lines:
@@ -1192,128 +975,123 @@ def checkProcAlive(procName):
             if line.find(os.getenv("USER")) >= 0:
                 return True
 
-    os.remove(GINI_TMP_FILE)
+    os.remove(GINI_TEMP_FILE)
     return alive
 
-def writeSrcFile(options):
-    "write the configuration in the setup file"
-    outFile = open(SRC_FILENAME, "w")
-    outFile.write("%s\n" % options.xmlFile)
-    outFile.write("%s\n" % options.switchDir)
-    outFile.write("%s\n" % options.routerDir)
-    outFile.write("%s\n" % options.umlDir)
-    outFile.write("%s\n" % options.binDir)
-    outFile.write("%s\n" % options.controllerDir)
+
+def write_source_file(opts):
+    """Write the configuration in the setup file"""
+    outFile = open(SOURCE_FILE_NAME, "w")
+    outFile.write("%s\n" % opts.xmlFile)
+    outFile.write("%s\n" % opts.switchDir)
+    outFile.write("%s\n" % opts.routerDir)
+    outFile.write("%s\n" % opts.machDir)
+    outFile.write("%s\n" % opts.binDir)
+    outFile.write("%s\n" % opts.controllerDir)
     outFile.close()
 
-def deleteSrcFile():
-    "delete the setup file"
-    if (os.access(SRC_FILENAME, os.W_OK)):
-        os.remove(SRC_FILENAME)
+
+def delete_source_file():
+    """Delete the setup file"""
+    if os.access(SOURCE_FILE_NAME, os.W_OK):
+        os.remove(SOURCE_FILE_NAME)
     else:
         print "Could not delete the GINI setup file"
 
-def checkAliveGini():
-    "check any of the gini components already running"
+
+def check_alive_GINI():
+    """Check if any of the gini components is already running"""
     result = False
-    if checkProcAlive(VS_PROG_BIN):
-        print "At least one of %s is alive" % VS_PROG_BIN
+    if check_process_alive(GROUTER_PROGRAM_BIN):
+        print "At least one of %s is alive" % GROUTER_PROGRAM_BIN
         result = True
-    if checkProcAlive(VM_PROG_BIN):
-        print "At least one of %s is alive" % VM_PROG_BIN
-        result = True
-    if checkProcAlive(GR_PROG_BIN):
-        print "At least one of %s is alive" % GR_PROG_BIN
-        result = True
-    if checkProcAlive(VOFC_PROG_BIN):
-        print "At least one of %s is alive" % VOFC_PROG_BIN
+    if check_process_alive(OPENFLOW_CONTROLLER_PROGRAM_BIN):
+        print "At least one of %s is alive" % OPENFLOW_CONTROLLER_PROGRAM_BIN
         result = True
     return result
 
 
-#### -------------- MAIN start ----------------####
+"""
+Create the program processor. This
+1. accepts and process the command line options
+2. creates XML processing engine, that in turn
+   a) validates the XML file
+   b) extracts the DOM object tree
+   c) populates the GINI network class library
+   d) performs some semantic/syntax checks on
+      the extracted specification
+"""
 
-# create the program processor. This
-# 1. accepts and process the command line options
-# 2. creates XML processing engine, that in turn
-#    a) validates the XML file
-#    b) extracts the DOM object tree
-#    c) populates the GINI network class library
-#    d) performs some semantic/syntax checkings on
-#       the extracted specification
-myProg = Program(sys.argv[0], SRC_FILENAME)
-if (not myProg.processOptions(sys.argv[1:])):
+my_program = Program(sys.argv[0], SOURCE_FILE_NAME)
+if not my_program.processOptions(sys.argv[1:]):
     sys.exit(1)
-options = myProg.options
+options = my_program.options
 
-# set the UML directory if is not given via -u option
-if (not options.umlDir):
-    # set it to the directory pointed by the $UML_DIR env
-    # if no such env variable, set the uml dir to curr dir
-    if (os.environ.has_key("UML_DIR")):
-        options.umlDir = os.environ["UML_DIR"]
+# set the Mach directory if is not given via -u option
+if not options.machDir:
+    # set it to the directory pointed by the $Mach_DIR env
+    # if no such env variable, set the mach dir to curr dir
+    if "Mach_DIR" in os.environ:
+        options.machDir = os.environ["Mach_DIR"]
     else:
-        options.umlDir = "."
+        options.machDir = "."
 
 # get the binaries
-binDir = options.binDir
-if (binDir):
+bin_dir = options.binDir
+if bin_dir:
     # get the absolute path for binary directory
-    if (binDir[len(binDir)-1] == "/"):
-        binDir = binDir[:len(binDir)-1]
-    binDir = getFullyQualifiedDir(binDir)
+    if bin_dir[len(bin_dir) - 1] == "/":
+        bin_dir = bin_dir[:len(bin_dir) - 1]
+    bin_dir = get_fully_qualified_dir(bin_dir)
+
     # assign binary names
-    # if the programs are not in the specified binDir
+    # if the programs are not in the specified bin_dir
     # they will be assumed to be in the $PATH env.
-    VS_PROG_BIN = "%s/%s" % (binDir, VS_PROG)
-    if (not os.access(VS_PROG_BIN, os.X_OK)):
-        VS_PROG_BIN = VS_PROG
-    VM_PROG_BIN = "%s/%s" % (binDir, VM_PROG)
-    if (not os.access(VM_PROG_BIN, os.X_OK)):
-        VM_PROG_BIN = VM_PROG
-    GR_PROG_BIN = "%s/%s" % (binDir, GR_PROG)
-    if (not os.access(GR_PROG_BIN, os.X_OK)):
-        GR_PROG_BIN = GR_PROG
-    MCONSOLE_PROG_BIN = "%s/%s" % (binDir, MCONSOLE_PROG)
-    if (not os.access(MCONSOLE_PROG_BIN, os.X_OK)):
-        MCONSOLE_PROG_BIN = MCONSOLE_PROG
-    VOFC_PROG_BIN = "%s/%s" % (binDir, VOFC_PROG)
-    if (not os.access(VOFC_PROG_BIN, os.X_OK)):
-        VOFC_PROG_BIN = VOFC_PROG
+    OPEN_VIRTUAL_SWITCH_PROGRAM_BIN = "%s/%s" % (bin_dir, OPEN_VIRTUAL_SWITCH_PROGRAM)
+    if not os.access(OPEN_VIRTUAL_SWITCH_PROGRAM_BIN, os.X_OK):
+        OPEN_VIRTUAL_SWITCH_PROGRAM_BIN = OPEN_VIRTUAL_SWITCH_PROGRAM
+
+    GROUTER_PROGRAM_BIN = "%s/%s" % (bin_dir, GROUTER_PROGRAM)
+    if not os.access(GROUTER_PROGRAM_BIN, os.X_OK):
+        GROUTER_PROGRAM_BIN = GROUTER_PROGRAM
+
+    OPENFLOW_CONTROLLER_PROGRAM_BIN = "%s/%s" % (bin_dir, OPENFLOW_CONTROLLER_PROGRAM)
+    if not os.access(OPENFLOW_CONTROLLER_PROGRAM_BIN, os.X_OK):
+        OPENFLOW_CONTROLLER_PROGRAM_BIN = OPENFLOW_CONTROLLER_PROGRAM
 
 # get the populated GINI network class
 # its structure is the same as the XML specification
-myGINI = myProg.giniNW
+myGINI = my_program.giniNW
 
 # create or terminate GINI network
 print ""
-if (myProg.destroyOpt):
+if my_program.destroyOpt:
     # terminate the current running specification
     print "Terminating GINI network..."
-    success = destroyGINI(myGINI, options)
-    if (success):
+    success = destroy_GINI(myGINI, options)
+    if success:
         print "\nGINI network is terminated!!\n"
     else:
         print "\nThere are errors in GINI network termination\n"
         sys.exit(1)
 else:
     # create the GINI instance
-    if (not options.keepOld):
+    if not options.keepOld:
         # fail if a GINI already alive
-        if checkAliveGini():
+        if check_alive_GINI():
             print "\nA Gini is already running"
             print "Terminate it before running another one\n"
             sys.exit(1)
 
-    if not os.environ.has_key("GINI_HOME"):
+    if "GINI_HOME" not in os.environ:
         print "environment variable $GINI_HOME not set, please set it for GINI to run properly"
         sys.exit(1)
 
-    # create network with current specifcation
+    # create network with current specification
     print "Creating GINI network..."
-    success = startGINI(myGINI, options)
-    writeSrcFile(options)
-    if (success):
+    success = start_GINI(myGINI, options)
+    write_source_file(options)
+    if success:
         print "\nGINI network up and running!!\n"
     else:
         print "\nGINI network start failed!!\n"
